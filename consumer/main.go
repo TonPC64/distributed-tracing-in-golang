@@ -1,156 +1,98 @@
 package main
 
-// SIGUSR1 toggle the pause/resume consumption
 import (
 	"context"
-	"flag"
 	"log"
-	"os"
-	"os/signal"
-	"strings"
-	"sync"
-	"syscall"
 
 	"github.com/Shopify/sarama"
-)
 
-// Sarama configuration options
-var (
-	brokers  = ""
-	version  = ""
-	group    = ""
-	topics   = ""
-	assignor = ""
-	oldest   = true
-	verbose  = false
+	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
+	"go.opentelemetry.io/contrib/propagators/b3"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/exporters/zipkin"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func init() {
-	flag.StringVar(&brokers, "brokers", "host.docker.internal:9092", "Kafka bootstrap brokers to connect to, as a comma separated list")
-	flag.StringVar(&group, "group", "sarama-consumer", "Kafka consumer group definition")
-	flag.StringVar(&version, "version", "2.1.1", "Kafka cluster version")
-	flag.StringVar(&topics, "topics", "example-topic", "Kafka topics to be consumed, as a comma separated list")
-	flag.StringVar(&assignor, "assignor", "roundrobin", "Consumer group partition assignment strategy (range, roundrobin, sticky)")
-	flag.BoolVar(&oldest, "oldest", true, "Kafka consumer consume initial offset from oldest")
-	flag.BoolVar(&verbose, "verbose", false, "Sarama logging")
-	flag.Parse()
+	var exporter sdktrace.SpanExporter
+	var err error
 
-	if len(brokers) == 0 {
-		panic("no Kafka bootstrap brokers defined, please set the -brokers flag")
+	exporter, err = zipkin.New("http://zipkin:9411/api/v2/spans")
+	if err != nil {
+		panic(err)
 	}
 
-	if len(topics) == 0 {
-		panic("no topics given to be consumed, please set the -topics flag")
+	exporter, err = jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
+	if err != nil {
+		panic(err)
 	}
 
-	if len(group) == 0 {
-		panic("no Kafka consumer group defined, please set the -group flag")
-	}
+	resources := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("consumer-sarama"),
+		semconv.ServiceVersionKey.String("1.0.0"),
+	)
+
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(resources),
+	)
+
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(b3.New())
 }
 
 func main() {
-	keepRunning := true
-	log.Println("Starting a new Sarama consumer")
+	startConsumerGroup([]string{"kafka:9092"})
 
-	if verbose {
-		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
-	}
+	select {}
+}
 
-	version, err := sarama.ParseKafkaVersion(version)
-	if err != nil {
-		log.Panicf("Error parsing Kafka version: %v", err)
-	}
+func startConsumerGroup(brokerList []string) {
+	consumerGroupHandler := Consumer{}
+	// Wrap instrumentation
+	handler := otelsarama.WrapConsumerGroupHandler(&consumerGroupHandler)
 
-	/**
-	 * Construct a new Sarama configuration.
-	 * The Kafka cluster version has to be defined before the consumer/producer is initialized.
-	 */
 	config := sarama.NewConfig()
-	config.Version = version
+	config.Version = sarama.V2_5_0_0
+	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 
-	switch assignor {
-	case "sticky":
-		config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategySticky
-	case "roundrobin":
-		config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin
-	case "range":
-		config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
-	default:
-		log.Panicf("Unrecognized consumer group partition assignor: %s", assignor)
-	}
-
-	if oldest {
-		config.Consumer.Offsets.Initial = sarama.OffsetOldest
-	}
-
-	/**
-	 * Setup a new Sarama consumer group
-	 */
-	consumer := Consumer{
-		ready: make(chan bool),
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	client, err := sarama.NewConsumerGroup(strings.Split(brokers, ","), group, config)
+	// Create consumer group
+	consumerGroup, err := sarama.NewConsumerGroup(brokerList, "example", config)
 	if err != nil {
-		log.Panicf("Error creating consumer group client: %v", err)
+		log.Fatalln("Failed to start sarama consumer group:", err)
 	}
 
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			// `Consume` should be called inside an infinite loop, when a
-			// server-side rebalance happens, the consumer session will need to be
-			// recreated to get the new claims
-			if err := client.Consume(ctx, strings.Split(topics, ","), &consumer); err != nil {
-				log.Panicf("Error from consumer: %v", err)
-			}
-			// check if context was cancelled, signaling that the consumer should stop
-			if ctx.Err() != nil {
-				return
-			}
-			consumer.ready = make(chan bool)
-		}
-	}()
-
-	<-consumer.ready // Await till the consumer has been set up
-	log.Println("Sarama consumer up and running!...")
-
-	sigusr1 := make(chan os.Signal, 1)
-	signal.Notify(sigusr1, syscall.SIGUSR1)
-
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
-
-	for keepRunning {
-		select {
-		case <-ctx.Done():
-			log.Println("terminating: context cancelled")
-			keepRunning = false
-		case <-sigterm:
-			log.Println("terminating: via signal")
-			keepRunning = false
-
-		}
+	err = consumerGroup.Consume(context.Background(), []string{"example-topic"}, handler)
+	if err != nil {
+		log.Fatalln("Failed to consume via handler:", err)
 	}
-	cancel()
-	wg.Wait()
-	if err = client.Close(); err != nil {
-		log.Panicf("Error closing client: %v", err)
-	}
+}
+
+func printMessage(msg *sarama.ConsumerMessage) {
+	// Extract tracing info from message
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), otelsarama.NewConsumerMessageCarrier(msg))
+
+	tr := otel.GetTracerProvider().Tracer("consumer")
+	_, span := tr.Start(ctx, "consume message", trace.WithAttributes(
+		semconv.MessagingOperationProcess,
+	))
+	defer span.End()
+
+	log.Println("Successful to read message: ", string(msg.Value))
 }
 
 // Consumer represents a Sarama consumer group consumer
 type Consumer struct {
-	ready chan bool
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
 func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
-	// Mark the consumer as ready
-	close(consumer.ready)
 	return nil
 }
 
@@ -164,9 +106,9 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 	// NOTE:
 	// Do not move the code below to a goroutine.
 	// The `ConsumeClaim` itself is called within a goroutine, see:
-	// https://github.com/Shopify/sarama/blob/main/consumer_group.go#L27-L29
+	// https://github.com/Shopify/sarama/blob/master/consumer_group.go#L27-L29
 	for message := range claim.Messages() {
-		log.Printf("Message claimed: value = %s, timestamp = %v, topic = %s", string(message.Value), message.Timestamp, message.Topic)
+		printMessage(message)
 		session.MarkMessage(message, "")
 	}
 
