@@ -6,7 +6,7 @@ require (
 	github.com/Shopify/sarama v1.31.1
 	github.com/gin-gonic/gin v1.7.7
 	github.com/gojek/heimdall/v7 v7.0.2
-	github.com/labstack/echo/v4 v4.6.3
+	github.com/labstack/echo/v4 v4.9.0
 	github.com/rs/zerolog v1.26.1
 	go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama v0.29.0
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.29.0
